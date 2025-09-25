@@ -37,6 +37,12 @@ export default function DataQuery() {
   //   const [interval, setInterval] = useState(null);
   const [office, setOffice] = useState("");
   const [mode, setMode] = useState("basic");
+  const prettyLabel = (tsid, units) => {
+  const [loc, param /*, type, interval */] = tsid.split(".");
+  const paramShort = param?.split("-")[0]; 
+  return `${loc} -${paramShort}${units ? ` (${units})` : ""}`;
+};
+
   useEffect(() => {
     // Reset visible list when tsids change
     setVisibleTSIDs(tsids);
@@ -146,15 +152,24 @@ export default function DataQuery() {
   });
 
   const timeseriesParams = useMemo(() => {
-    // Build table params from timeseriesData
     if (!timeseriesData) return [];
-    return timeseriesData.tsids
-      .map((series, index) => ({
-        tsid: tsids[index],
-        header: `${tsids[index].split(".")[1]} (${series.units})`,
-        rounding: getPrecision(series.units),
-      }))
-      .filter((p) => visibleTSIDs.includes(p.tsid));
+
+    // Map original tsid -> merged series meta so lookups are stable
+    const seriesByTsid = Object.fromEntries(
+      timeseriesData.tsids.map((series, i) => [tsids[i], series])
+    );
+
+    return visibleTSIDs
+      .map((tsid) => {
+        const series = seriesByTsid[tsid];
+        const units = series?.units;
+        return {
+          tsid,
+          header: prettyLabel(tsid, units),     // <-- clear, unique column header
+          rounding: getPrecision(units),
+        };
+      })
+      .filter(Boolean);
   }, [timeseriesData, tsids, visibleTSIDs]);
 
   const cdaParams = useMemo(
@@ -165,63 +180,83 @@ export default function DataQuery() {
     }),
     [beginDateTime, endDateTime, office]
   );
-  const handleDownloadCSV = () => {
-    if (!timeseriesData || timeseriesData.dates.length === 0) {
-      console.warn("No data to export");
-      return;
-    }
-    const parameters = visibleTSIDs.map((ts) => ts.split(".")[1]);
-    const header = ["Date", ...parameters];
+  // helper: make a safe label for CSV (no em dash)
+const csvLabel = (tsid, units) =>
+  prettyLabel(tsid, units).replace(/\u2014/g, "-");
+
+// helper: quote CSV fields and escape internal quotes
+const csvq = (v) => `"${String(v).replace(/"/g, '""')}"`;
+
+const handleDownloadCSV = () => {
+    if (!timeseriesData || timeseriesData.dates.length === 0) return;
+
+    // tsid -> merged series meta (units, etc.)
+    const seriesByTsid = Object.fromEntries(
+      timeseriesData.tsids.map((series, i) => [tsids[i], series])
+    );
+
+    // header, keep order consistent with visibleTSIDs
+    const header = [
+      "Date",
+      ...visibleTSIDs.map((tsid) => csvLabel(tsid, seriesByTsid[tsid]?.units)),
+    ];
+
+    // tsid -> column index in merged values array
+    const idxByTsid = Object.fromEntries(tsids.map((t, i) => [t, i]));
+
     const rows = timeseriesData.dates.map((date) => {
       const formattedDate = dayjs(date).format("YYYY-MM-DD HH:mm:ss");
       const values = timeseriesData.values[date] || [];
-      const paddedValues = visibleTSIDs.map((_, i) => {
-        const val = values[i];
-        return val === null || val === undefined ? "" : val;
-      });
-      return [formattedDate, ...paddedValues];
-    });
-    const csvContent = [header, ...rows].map((row) => row.join(",")).join("\n");
-    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
 
-    const link = document.createElement("a");
-    const locName = tsids[0].split(".")[0];
-    link.setAttribute("href", url);
-    link.setAttribute(
-      "download",
-      `${locName}_${parameters.length}_params_${beginDateTime.format(
-        "YYYY-MM-DD"
-      )}_${endDateTime.format("YYYY-MM-DD")}.csv`
+      // pull each value by its true index in the merged array
+      const cols = visibleTSIDs.map((tsid) => {
+        const idx = idxByTsid[tsid];
+        const val = values[idx];
+        return val == null ? "" : val;
+      });
+
+      return [formattedDate, ...cols];
+    });
+
+    // build CSV with BOM, CRLF, and quoting
+    const csv = [
+      header.map(csvq).join(","),
+      ...rows.map((r) => r.map(csvq).join(",")),
+    ].join("\r\n");
+
+    const blob = new Blob(
+      // BOM forces Excel to read UTF-8
+      ["\uFEFF", csv],
+      { type: "text/csv;charset=utf-8;" }
     );
-    link.style.visibility = "hidden";
+
+    const url = URL.createObjectURL(blob);
+    const locName = tsids[0]?.split(".")[0] ?? "timeseries";
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${locName}_${visibleTSIDs.length}_series_${beginDateTime.format(
+      "YYYY-MM-DD"
+    )}_${endDateTime.format("YYYY-MM-DD")}.csv`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
   };
+
   const handleDownloadJSON = () => {
-    if (!timeseriesData || timeseriesData.dates.length === 0) {
-      console.warn("No data to export");
-      return;
-    }
+    if (!timeseriesData || timeseriesData.dates.length === 0) return;
 
     const jsonContent = JSON.stringify(timeseriesData.raw, null, 2);
     const blob = new Blob([jsonContent], { type: "application/json" });
     const url = URL.createObjectURL(blob);
 
-    const parameter = tsids[0].split(".")[1];
-    const locName = tsids[0].split(".")[0];
-    const paramName = parameter.split("-")[0].split(".")[0];
+    const locName = tsids[0]?.split(".")[0] ?? "timeseries";
+    const seriesCount = tsids.length;
 
     const link = document.createElement("a");
-    link.setAttribute("href", url);
-    link.setAttribute(
-      "download",
-      `${locName}_${paramName}_${beginDateTime.format(
-        "YYYY-MM-DD"
-      )}_${endDateTime.format("YYYY-MM-DD")}.json`
-    );
-    link.style.visibility = "hidden";
+    link.href = url;
+    link.download = `${locName}_${seriesCount}_series_${beginDateTime.format(
+      "YYYY-MM-DD"
+    )}_${endDateTime.format("YYYY-MM-DD")}.json`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -252,7 +287,7 @@ export default function DataQuery() {
                   const _office = e.target.value;
                   if (!_office) {
                     setOffice(null);
-                    setInterval(null);
+                    // setInterval(null);
                     setTsids([]);
                     return;
                   }
